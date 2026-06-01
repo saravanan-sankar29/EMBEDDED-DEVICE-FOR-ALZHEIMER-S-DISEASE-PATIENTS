@@ -1,0 +1,313 @@
+/**
+ * ============================================================
+ * EMBEDDED DEVICE FOR ALZHEIMER'S DISEASE PATIENTS
+ * VIT Chennai – B.Tech EEE Final Year Project
+ * Author     : Saravanan S
+ * Supervisor : Dr. Balamurugan P
+ * ============================================================
+ *
+ * HARDWARE CONNECTIONS:
+ * ─────────────────────────────────────────────────────────
+ * Component          ESP32 Pin   Protocol    VCC
+ * ─────────────────────────────────────────────────────────
+ * NEO-6M GPS TX  →   GPIO16 (RX2)  UART      3.3 V–5 V
+ * NEO-6M GPS RX  →   GPIO17 (TX2)  UART      (same)
+ * Pulse Sensor   →   GPIO34        Analog    3.3 V
+ * MPU-6050 SDA   →   GPIO21        I²C       3.3 V
+ * MPU-6050 SCL   →   GPIO22        I²C       3.3 V
+ * GSR Sensor     →   GPIO35        Analog    3.3 V–5 V
+ * DFPlayer RX    →   GPIO26 (TX)   Serial    5 V
+ * DFPlayer TX    →   GPIO27 (RX)   Serial    5 V
+ * Speaker        →   DFPlayer SPK  –         –
+ *
+ * REQUIRED LIBRARIES:
+ * ─────────────────────────────────────────────────────────
+ * • Blynk             (v1.3.x)
+ * • TinyGPS++         
+ * • MPU6050           (by Electronic Cats)
+ * • DFRobotDFPlayerMini
+ * • NTPClient         
+ * • SoftwareSerial
+ */
+
+// ──────────────────────────────────────────────────────────────
+//  BLYNK CREDENTIALS
+// ──────────────────────────────────────────────────────────────
+#define BLYNK_TEMPLATE_ID   "TMPL32SDThmST"
+#define BLYNK_TEMPLATE_NAME "AlzheimerDevice"
+#define BLYNK_AUTH_TOKEN    "YourBlynkAuthTokenHere"  // Replace with your actual token
+#define BLYNK_PRINT Serial
+
+// ──────────────────────────────────────────────────────────────
+//  INCLUDES
+// ──────────────────────────────────────────────────────────────
+#include <WiFi.h>
+#include <BlynkSimpleEsp32.h>
+#include <Wire.h>
+#include <MPU6050.h>
+#include <TinyGPSPlus.h>
+#include <HardwareSerial.h>
+#include <SoftwareSerial.h>
+#include <DFRobotDFPlayerMini.h>
+#include <NTPClient.h>
+#include <WiFiUdp.h>
+
+// ──────────────────────────────────────────────────────────────
+//  WIFI CREDENTIALS
+// ──────────────────────────────────────────────────────────────
+const char* ssid     = "Galaxy M55 5G 4408";
+const char* password = "ranga123";
+
+// ──────────────────────────────────────────────────────────────
+//  PIN DEFINITIONS
+// ──────────────────────────────────────────────────────────────
+#define PULSE_PIN   34    // Analog – Pulse Sensor
+#define GSR_PIN     35    // Analog – GSR Sensor
+
+// GPS configuration on HardwareSerial 2 (RX=16, TX=17)
+HardwareSerial gpsSerial(2);
+TinyGPSPlus    gps;
+
+// DFPlayer uses SoftwareSerial for custom TX/RX pins
+SoftwareSerial dfSerial(27, 26);   // RX=GPIO27, TX=GPIO26
+DFRobotDFPlayerMini dfPlayer;
+
+// MPU-6050 Accelerometer/Gyroscope
+MPU6050 mpu;
+
+// ──────────────────────────────────────────────────────────────
+//  NTP TIME CLIENT (IST Offset = UTC + 5:30 = 19800 seconds)
+// ──────────────────────────────────────────────────────────────
+WiFiUDP   ntpUDP;
+NTPClient timeClient(ntpUDP, "pool.ntp.org", 19800, 60000);
+
+// ──────────────────────────────────────────────────────────────
+//  TIMING & THRESHOLD CONSTANTS
+// ──────────────────────────────────────────────────────────────
+const unsigned long SENSOR_INTERVAL  = 5000;   // 5-second sensor refresh loop
+const unsigned long GPS_TIMEOUT_MS   = 2000;   // Non-blocking parse window
+const int   PULSE_MIN          =  60;          // Lower boundary for valid pulse
+const int   PULSE_MAX          = 180;          // Upper boundary for valid pulse
+const int   GSR_STRESS_THRESH  = 2000;         // ADC limit indicating stress response
+const float FALL_ACCEL_THRESH  = 2.5f;         // Sudden impact g-force index
+
+// ──────────────────────────────────────────────────────────────
+//  AUTOMATED REMINDER SCHEDULE { hour, minute, track_number }
+// ──────────────────────────────────────────────────────────────
+struct Reminder { int h; int m; int track; };
+const Reminder REMINDERS[] = {
+  {  8, 00, 1 },   // 08:00 – Track 1: Morning medicine
+  { 10, 00, 2 },   // 10:00 – Track 2: Drink water
+  { 12, 00, 2 },   // 12:00 – Track 2: Drink water
+  { 15, 00, 3 },   // 15:00 – Track 3: Walk reminder
+  { 18, 00, 2 },   // 18:00 – Track 2: Drink water
+  { 20, 00, 4 },   // 20:00 – Track 4: Evening medicine
+};
+const int NUM_REMINDERS = sizeof(REMINDERS) / sizeof(REMINDERS[0]);
+
+// ──────────────────────────────────────────────────────────────
+//  STATE MANAGEMENT VARIABLES
+// ──────────────────────────────────────────────────────────────
+unsigned long lastSensorTime   = 0;
+int           lastReminderMin  = -1; // Mitigation for multi-triggers within same minute
+bool          fallDetected     = false;
+int           currentBPM       = 0;
+int           currentGSR       = 0;
+float         gpsLat           = 0.0;
+float         gpsLng           = 0.0;
+bool          stressHigh       = false;
+
+BlynkTimer timer;
+
+// ══════════════════════════════════════════════════════════════
+//  FUNCTION PROTOTYPES
+// ══════════════════════════════════════════════════════════════
+void readPulseSensor();
+void readGSRSensor();
+void readMPU6050();
+void readGPS();
+void sendToBlynk();
+void checkReminders();
+void handleFallAlert();
+void handleStressAlert();
+
+// ══════════════════════════════════════════════════════════════
+//  SETUP
+// ══════════════════════════════════════════════════════════════
+void setup() {
+  Serial.begin(115200);
+  Serial.println("\n[BOOT] Alzheimer Embedded Device Starting...");
+
+  // Establish Local Wi-Fi Connection
+  WiFi.begin(ssid, password);
+  Serial.print("[WiFi] Connecting");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\n[WiFi] Connected. IP: " + WiFi.localIP().toString());
+
+  // Establish Blynk Cloud Interface
+  Blynk.begin(BLYNK_AUTH_TOKEN, ssid, password);
+  Serial.println("[Blynk] Connected");
+
+  // Sync Global Network Time
+  timeClient.begin();
+  timeClient.update();
+  Serial.printf("[NTP] Time synced: %02d:%02d\n", timeClient.getHours(), timeClient.getMinutes());
+
+  // Initialize I2C Bus and MPU-6050 Motion Unit
+  Wire.begin(21, 22);
+  mpu.initialize();
+  if (mpu.testConnection()) {
+    Serial.println("[MPU6050] Interfaced Successfully");
+  } else {
+    Serial.println("[MPU6050] Initialization Failed – Verify Bus Line");
+  }
+
+  // Initialize Hardware UART2 for GPS Parsing
+  gpsSerial.begin(9600, SERIAL_8N1, 16, 17);
+  Serial.println("[GPS] NEO-6M initialized on UART2");
+
+  // Initialize Software Serial and Audio Driver for Reminders
+  dfSerial.begin(9600);
+  if (!dfPlayer.begin(dfSerial)) {
+    Serial.println("[DFPlayer] Init Failed – Check Storage/Wiring");
+  } else {
+    Serial.println("[DFPlayer] Ready");
+    dfPlayer.volume(25); // Volume range: 0-30
+  }
+
+  // Bind Scheduled Execution loops to the Blynk Framework (Every 5 seconds)
+  timer.setInterval(SENSOR_INTERVAL, []() {
+    readPulseSensor();
+    readGSRSensor();
+    readMPU6050();
+    readGPS();
+    sendToBlynk();
+    checkReminders();
+  });
+
+  Serial.println("[BOOT] Setup phase complete. Entering execution loop...\n");
+}
+
+// ══════════════════════════════════════════════════════════════
+//  LOOP
+// ══════════════════════════════════════════════════════════════
+void loop() {
+  Blynk.run();
+  timer.run();
+  timeClient.update();
+
+  // Continuously pass stream characters into the TinyGPS++ parser logic
+  unsigned long gpsStart = millis();
+  while (millis() - gpsStart < GPS_TIMEOUT_MS && gpsSerial.available()) {
+    gps.encode(gpsSerial.read());
+  }
+}
+
+// ══════════════════════════════════════════════════════════════
+//  SENSOR PARSING SUBROUTINES
+// ══════════════════════════════════════════════════════════════
+
+void readPulseSensor() {
+  int raw = analogRead(PULSE_PIN); // 12-bit Analog Conversion (0 - 4095)
+  int bpm = map(raw, 0, 4095, 0, 180);
+  bpm = constrain(bpm, 0, 180);
+
+  bool heartPresent = (bpm >= PULSE_MIN && bpm <= PULSE_MAX);
+  currentBPM = heartPresent ? bpm : currentBPM; // Fail-safe: Maintain last validated state
+
+  Serial.printf("[Pulse] Raw ADC: %d | Computed BPM: %d | Valid Signal: %s\n", raw, currentBPM, heartPresent ? "YES" : "NO");
+}
+
+void readGSRSensor() {
+  long sum = 0;
+  for (int i = 0; i < 10; i++) {
+    sum += analogRead(GSR_PIN);
+    delay(10);
+  }
+  currentGSR = sum / 10;
+  stressHigh = (currentGSR > GSR_STRESS_THRESH);
+
+  Serial.printf("[GSR] Average ADC: %d | Status: %s\n", currentGSR, stressHigh ? "HIGH STRESS" : "Calm");
+  if (stressHigh) {
+    handleStressAlert();
+  }
+}
+
+void readMPU6050() {
+  int16_t ax, ay, az, gx, gy, gz;
+  mpu.getMotion6(&ax, &ay, &az, &gx, &gy, &gz);
+
+  // Map raw LSB output to actual gravity vectors (Standard ±2g Scale Factor = 16384 LSB/g)
+  float axG = ax / 16384.0f;
+  float ayG = ay / 16384.0f;
+  float azG = az / 16384.0f;
+
+  // Compute Total Acceleration Magnitude vector
+  float totalAccel = sqrt(axG*axG + ayG*ayG + azG*azG);
+
+  if (totalAccel > FALL_ACCEL_THRESH) {
+    fallDetected = true;
+    handleFallAlert();
+  } else {
+    fallDetected = false;
+  }
+}
+
+void readGPS() {
+  if (gps.location.isValid()) {
+    gpsLat = gps.location.latitude();
+    gpsLng = gps.location.longitude();
+    Serial.printf("[GPS] Location Coordinates: Lat: %.6f, Lng: %.6f\n", gpsLat, gpsLng);
+  } else {
+    Serial.println("[GPS] Seeking satellite connection fix...");
+  }
+}
+
+// ══════════════════════════════════════════════════════════════
+//  TELEMETRY & ALERT ROUTING
+// ══════════════════════════════════════════════════════════════
+
+void sendToBlynk() {
+  Blynk.virtualWrite(V0, currentBPM);
+  Blynk.virtualWrite(V1, currentGSR);
+  Blynk.virtualWrite(V2, stressHigh ? "High Stress" : "Calm");
+  Blynk.virtualWrite(V3, fallDetected ? "FALL DETECTED" : "None");
+  
+  if (gpsLat != 0.0 && gpsLng != 0.0) {
+    Blynk.virtualWrite(V4, String(gpsLat, 6));
+    Blynk.virtualWrite(V5, String(gpsLng, 6));
+  }
+}
+
+void checkReminders() {
+  int h = timeClient.getHours();
+  int m = timeClient.getMinutes();
+
+  for (int i = 0; i < NUM_REMINDERS; i++) {
+    if (REMINDERS[i].h == h && REMINDERS[i].m == m) {
+      if (m == lastReminderMin) return; // Already triggered within the current minute window
+
+      Serial.printf("[Reminder] Executing Schedule Task Node -> Track ID: %d\n", REMINDERS[i].track);
+      dfPlayer.play(REMINDERS[i].track);
+      lastReminderMin = m; 
+
+      Blynk.logEvent("reminder", "Automated Voice Reminder Broadcasted at " + String(h) + ":" + (m < 10 ? "0" : "") + String(m));
+      break;
+    }
+  }
+}
+
+void handleFallAlert() {
+  Serial.println("[ALERT] *** CRITICAL HARDWARE EVENT: FALL DETECTED ***");
+  Blynk.logEvent("fall_alert", 
+    "CRITICAL: Sudden physical impact detected. Patient may require physical assistance. "
+    "Coordinates: Lat " + String(gpsLat, 6) + ", Lng " + String(gpsLng, 6));
+}
+
+void handleStressAlert() {
+  Serial.println("[ALERT] *** PATHOLOGICAL VARIATION: ELEVATED ANXIETY MARGIN ***");
+  Blynk.logEvent("stress_alert", "High physiological stress index registered. Heart rate tracking: " + String(currentBPM) + " BPM.");
+}
