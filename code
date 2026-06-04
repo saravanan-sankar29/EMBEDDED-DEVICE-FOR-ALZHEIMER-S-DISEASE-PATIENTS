@@ -56,7 +56,7 @@
 //  WIFI CREDENTIALS
 // ──────────────────────────────────────────────────────────────
 const char* ssid     = "Galaxy M55 5G 4408";
-const char* password = "ranga123";
+const char* password = "sara123";
 
 // ──────────────────────────────────────────────────────────────
 //  PIN DEFINITIONS
@@ -88,7 +88,7 @@ const unsigned long SENSOR_INTERVAL  = 5000;   // 5-second sensor refresh loop
 const unsigned long GPS_TIMEOUT_MS   = 2000;   // Non-blocking parse window
 const int   PULSE_MIN          =  60;          // Lower boundary for valid pulse
 const int   PULSE_MAX          = 180;          // Upper boundary for valid pulse
-const int   GSR_STRESS_THRESH  = 2000;         // ADC limit indicating stress response
+const int   GSR_STRESS_THRESH  = 2500;         // ADC limit indicating stress response
 const float FALL_ACCEL_THRESH  = 2.5f;         // Sudden impact g-force index
 
 // ──────────────────────────────────────────────────────────────
